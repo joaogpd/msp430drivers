@@ -1,0 +1,18 @@
+# CCS build output
+Debug/
+Release/
+*.obj
+*.out
+*.map
+
+# CCS per-user launch configurations
+.launches/
+
+# LaTeX intermediate files (the PDFs are kept)
+report/*.aux
+report/*.bbl
+report/*.blg
+report/*.log
+report/*.out
+report/*.toc
+report/*.synctex.gz

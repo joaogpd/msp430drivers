@@ -1,0 +1,110 @@
+/*
+ * main.c - Layer 1 driver demo for the MSP-EXP430FR5994
+ *
+ * What it does:
+ *   Boot   : red LED blinks N times to report why the device started:
+ *              1 = power-on / supply loss (BOR, SVSH)
+ *              2 = LPMx.5 wake-up
+ *              3 = RST pin / debugger reset
+ *              4 = watchdog
+ *              5 = software reset
+ *              6 = fault (FRAM, MPU, password violation)
+ *            Both LEDs on for 1 s afterwards = 32 kHz crystal failed (ACLK on VLO).
+ *   Run    : CPU sleeps in LPM3. WDT interval mode (ACLK, 250 ms) wakes it;
+ *            green LED flashes once per second as a heartbeat.
+ *   S1     : toggles the red LED.
+ *   S2     : simulates a firmware hang - switches the WDT to watchdog mode
+ *            and stops kicking it. ~1 s later the device resets and reports
+ *            4 blinks.
+ */
+#include <msp430.h>
+#include "drivers/board.h"
+#include "drivers/cs.h"
+#include "drivers/pmm.h"
+#include "drivers/wdt.h"
+
+#define DEBOUNCE_TICKS  (1u)    /* 250 ms tick -> 250..500 ms lockout */
+
+static volatile bool    s_s1_event;
+static volatile bool    s_s2_event;
+static volatile uint8_t s_debounce;
+static volatile uint8_t s_tick;
+
+static bool on_button(gpio_port_t port, uint8_t pin)
+{
+    (void)port;
+    /* Lock the button out until the tick handler re-arms it */
+    gpio_interrupt_disable(BOARD_S1_PORT, BOARD_S1_PIN | BOARD_S2_PIN);
+    s_debounce = DEBOUNCE_TICKS + 1u;
+
+    if ((uint8_t)(1u << pin) == BOARD_S1_PIN) { s_s1_event = true; }
+    if ((uint8_t)(1u << pin) == BOARD_S2_PIN) { s_s2_event = true; }
+    return true;                /* wake main */
+}
+
+static bool on_tick(void)
+{
+    s_tick++;
+    board_led2((s_tick & 3u) == 0u);       /* 250 ms flash every 1 s */
+
+    if (s_debounce && (--s_debounce == 0u))
+    {
+        gpio_interrupt_clear(BOARD_S1_PORT, BOARD_S1_PIN | BOARD_S2_PIN);
+        gpio_interrupt_enable(BOARD_S1_PORT, BOARD_S1_PIN | BOARD_S2_PIN);
+    }
+    return false;               /* nothing for main to do */
+}
+
+static void blink_red(uint8_t times)
+{
+    while (times--)
+    {
+        board_led1(true);
+        cs_delay_ms(150u);
+        board_led1(false);
+        cs_delay_ms(250u);
+    }
+}
+
+int main(void)
+{
+    board_init();                           /* WDT held, reset cause latched, I/O unlocked */
+
+    const cs_config_t clk = CS_CONFIG_DEFAULT;  /* 8 MHz, LFXT on */
+    cs_status_t cs = cs_init(&clk);
+
+    blink_red((uint8_t)pmm_boot_reason() + 1u);
+    if (cs == CS_LFXT_FAULT)
+    {
+        board_led1(true);
+        board_led2(true);
+        cs_delay_ms(1000u);
+        board_led1(false);
+        board_led2(false);
+    }
+
+    gpio_set_callback(BOARD_S1_PORT, BOARD_S1_PIN | BOARD_S2_PIN, on_button);
+    gpio_interrupt_enable(BOARD_S1_PORT, BOARD_S1_PIN | BOARD_S2_PIN);
+
+    wdt_start_interval(WDT_CLK_ACLK, WDT_DIV_8192, on_tick);   /* 250 ms @ 32 kHz */
+
+    for (;;)
+    {
+        pmm_enter_lpm(PMM_LPM3);
+
+        if (s_s1_event)
+        {
+            s_s1_event = false;
+            board_led1_toggle();
+        }
+
+        if (s_s2_event)
+        {
+            s_s2_event = false;
+            board_led1(true);
+            board_led2(false);
+            wdt_start_watchdog(WDT_CLK_ACLK, WDT_DIV_32K);     /* 1 s timeout */
+            for (;;) { }                                       /* "hang" */
+        }
+    }
+}
