@@ -32,16 +32,16 @@
  */
 #include <msp430.h>
 #include <string.h>
-#include "drivers/board.h"
-#include "drivers/cs.h"
-#include "drivers/pmm.h"
-#include "drivers/wdt.h"
-#include "drivers/adc.h"
-#include "drivers/rtc.h"
-#include "drivers/timer.h"
-#include "drivers/crc.h"
-#include "drivers/ckpt.h"
-#include "drivers/uart.h"
+#include "drivers/board/board.h"
+#include "drivers/msp430/cs.h"
+#include "drivers/msp430/pmm.h"
+#include "drivers/msp430/wdt.h"
+#include "drivers/msp430/adc.h"
+#include "drivers/msp430/rtc.h"
+#include "drivers/msp430/timer.h"
+#include "drivers/msp430/crc.h"
+#include "drivers/msp430/ckpt.h"
+#include "drivers/msp430/uart.h"
 #include "app/console.h"
 #include "app/history.h"
 
@@ -69,7 +69,7 @@ static clock_src_t s_clock;
 #define CKPT_STRESS_TEST    0
 #endif
 /* The fault-injection build (test 4) is switched by CKPT_FAULT_TEST in
-   drivers/ckpt.h, because ckpt.c needs it too. */
+   drivers/msp430/ckpt.h, because ckpt.c needs it too. */
 
 /*
  * Deep-sleep test build (test 1): set to 1 to run the LPM3.5 path on USB

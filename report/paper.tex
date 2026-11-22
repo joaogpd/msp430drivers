@@ -578,7 +578,8 @@ Last 40\,min & 21 & 24.6\,\textmu V/s & 5.41\uA \\
 \toprule
 Path & Contents \\
 \midrule
-\code{drivers/} & hal\_common, gpio, board, cs, pmm, wdt, ref, adc, rtc, timer, crc, ckpt, uart \\
+\code{drivers/msp430/} & hal\_common, gpio, cs, pmm, wdt, ref, adc, rtc, timer, crc, ckpt, uart \\
+\code{drivers/board/} & LaunchPad bring-up and pin map (board) \\
 \code{app/console.*} & Command console \\
 \code{main.c} & Logger, console commands and the test modes \\
 \code{report/} & This paper (\code{lab\_report.tex}), \code{references.bib}, plot data in \code{data/} \\
@@ -594,11 +595,11 @@ Path & Contents \\
 Switch & File & Effect when 1 \\
 \midrule
 \code{CKPT\_STRESS\_TEST} & \code{main.c} & Continuous saves for unplug testing (E3) \\
-\code{CKPT\_FAULT\_TEST} & \code{drivers/ckpt.h} & Cut points in \code{ckpt\_save}, fault sequence (E4) \\
+\code{CKPT\_FAULT\_TEST} & \code{drivers/msp430/ckpt.h} & Cut points in \code{ckpt\_save}, fault sequence (E4) \\
 \code{LPM35\_TEST} & \code{main.c} & Scheduled LPM3.5 episodes on USB (E5, E7) \\
 \code{LED\_AB\_TEST} & \code{main.c} & LED every sample for 75 samples, then every 16th (E9) \\
 \code{CONSOLE\_E10\_TEST} & \code{main.c} & Console off / idle / streaming in one capture (E10) \\
-\code{ADC\_TEMP\_AVG} & \code{drivers/adc.h} & Conversions averaged per temperature reading (default 8) \\
+\code{ADC\_TEMP\_AVG} & \code{drivers/msp430/adc.h} & Conversions averaged per temperature reading (default 8) \\
 \bottomrule
 \end{tabularx}
 \end{table}

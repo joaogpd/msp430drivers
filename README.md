@@ -3,8 +3,12 @@
 Register-level drivers and a power-loss-tolerant data logger for the
 MSP-EXP430FR5994 LaunchPad, running from the board's 0.22 F supercapacitor.
 
-- `drivers/` – Layer 1–3 drivers: gpio, board, cs, pmm, wdt, ref, adc, rtc,
-  timer, crc, ckpt (two-slot FRAM checkpoint store), uart
+- `drivers/msp430/` – MSP430 peripheral drivers: hal_common, gpio, cs, pmm,
+  wdt, ref, adc, rtc, timer, crc, uart, and ckpt (two-slot FRAM checkpoint
+  store)
+- `drivers/board/` – LaunchPad bring-up and pin map
+- `drivers/devices/` – drivers for external devices (none in this project;
+  see epaper_display and cc1101_radio)
 - `app/` – command console and the FRAM history log
 - `main.c` – the logger, console commands and the test modes
 - `report/` – test report (`lab_report.tex`/`.pdf`), the earlier paper-style

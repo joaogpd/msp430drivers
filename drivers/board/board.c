@@ -2,8 +2,8 @@
  * board.c - MSP-EXP430FR5994 LaunchPad bring-up
  */
 #include "board.h"
-#include "pmm.h"
-#include "wdt.h"
+#include "drivers/msp430/pmm.h"
+#include "drivers/msp430/wdt.h"
 
 void board_init(void (*before_unlock)(void))
 {

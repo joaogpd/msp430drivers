@@ -12,7 +12,7 @@
 #ifndef DRIVERS_BOARD_H_
 #define DRIVERS_BOARD_H_
 
-#include "gpio.h"
+#include "drivers/msp430/gpio.h"
 
 #define BOARD_LED1_PORT     GPIO_PORT_1
 #define BOARD_LED1_PIN      GPIO_PIN0

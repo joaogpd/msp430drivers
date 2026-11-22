@@ -320,7 +320,7 @@ Test behaviour is selected with compile-time switches (Table~\ref{tab:switches})
 Switch & File & Effect when 1 \\
 \midrule
 \code{CKPT\_STRESS\_TEST} & \code{main.c} & Continuous saves for unplug testing (T3) \\
-\code{CKPT\_FAULT\_TEST} & \code{drivers/ckpt.h} & Cut points in \code{ckpt\_save}, fault sequence (T4) \\
+\code{CKPT\_FAULT\_TEST} & \code{drivers/msp430/ckpt.h} & Cut points in \code{ckpt\_save}, fault sequence (T4) \\
 \code{LPM35\_TEST} & \code{main.c} & Scheduled LPM3.5 episodes on USB power (T5, T7) \\
 \code{LED\_AB\_TEST} & \code{main.c} & LED every sample for 75 samples, then every 16th (T8) \\
 \code{CONSOLE\_E10\_TEST} & \code{main.c} & Console off / idle / streaming in one capture (T9) \\
@@ -913,7 +913,8 @@ Red LED flashes at boot give the restart reason (1 power-on, 2 LPMx.5 wake, 3 re
 \toprule
 Path & Contents \\
 \midrule
-\code{drivers/} & hal\_common, gpio, board, cs, pmm, wdt, ref, adc, rtc, timer, crc, ckpt, uart \\
+\code{drivers/msp430/} & MSP430 peripheral drivers: hal\_common, gpio, cs, pmm, wdt, ref, adc, rtc, timer, crc, ckpt, uart \\
+\code{drivers/board/} & LaunchPad bring-up and pin map (board) \\
 \code{app/} & Command console and history log \\
 \code{main.c} & Logger, console commands and the test modes \\
 \code{report/lab\_report.tex} & This report; \code{paper.tex} is the earlier paper-style version \\

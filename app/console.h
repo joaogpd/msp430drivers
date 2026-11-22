@@ -18,7 +18,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
-#include "../drivers/uart.h"
+#include "../drivers/msp430/uart.h"
 
 #define CONSOLE_LINE_MAX    (48u)
 #define CONSOLE_ARGS_MAX    (6u)
