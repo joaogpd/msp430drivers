@@ -42,6 +42,7 @@ typedef enum
 #define HIST_CFG_INTERVAL   (1u)    /* vcc_mv = new history interval, s */
 #define HIST_CFG_TOFF       (2u)    /* temp_dc = new temperature offset, 0.1 C */
 #define HIST_CFG_VOFF       (3u)    /* vcc_mv = new VCC offset, mV, as int16 */
+#define HIST_CFG_RADIO      (4u)    /* vcc_mv = new radio period, s (0 = off) */
 
 /* HIST_BOOT arg bits besides the boot reason in bits 0-3 */
 #define HIST_BOOT_SWBOR     (0x40u) /* software reset was a BOR (else POR) */

@@ -1,98 +1,136 @@
 /*
- * console.c - Line-based command console over a UART
+ * console.c - Line-based command console on one or more byte ports
  */
 #include "console.h"
 #include <string.h>
 
-static uart_id_t            s_uart;
+typedef struct
+{
+    con_port_ops_t   ops;
+    bool             attached;
+    volatile bool    machine;           /* no echo, no prompt, tagged replies */
+    char             line[CONSOLE_LINE_MAX + 1u];
+    volatile uint8_t len;
+    volatile bool    ready;             /* a complete line waits for console_poll */
+    bool             last_cr;           /* swallow the LF of a CR LF pair */
+} port_t;
+
 static const console_cmd_t *s_cmds;
 static uint8_t              s_count;
-static bool                 s_bound;
-static volatile bool        s_machine;  /* no echo, no prompt, tagged replies */
+static port_t               s_port[CON_PORT_COUNT];
+static con_port_t           s_out;      /* where con_* output goes */
 
-static char          s_line[CONSOLE_LINE_MAX + 1u];
-static volatile uint8_t s_len;
-static volatile bool s_ready;
-static bool          s_last_cr;     /* swallow the LF of a CR LF pair */
-
-void console_set_machine(bool on) { s_machine = on; }
-bool console_machine(void)        { return s_machine; }
-
-void console_init(uart_id_t uart, const console_cmd_t *cmds, uint8_t count)
+void console_init(const console_cmd_t *cmds, uint8_t count)
 {
-    s_uart  = uart;
     s_cmds  = cmds;
     s_count = count;
-    s_len   = 0u;
-    s_ready = false;
-    s_last_cr = false;
-    s_machine = false;                  /* every start is in human mode */
-    s_bound = true;
+    s_out   = CON_PORT_UART;
 }
 
-static void echo(const char *s, uint16_t n)
+void console_attach(con_port_t port, const con_port_ops_t *ops)
 {
-    if (s_machine) { return; }          /* the host does not want echo */
-    (void)uart_write(s_uart, s, n);     /* non-blocking: ISR context */
+    if ((unsigned)port >= CON_PORT_COUNT || !ops || !ops->write) { return; }
+    port_t *p = &s_port[port];
+    p->attached = false;                /* the RX side ignores it meanwhile */
+    p->ops      = *ops;
+    p->len      = 0u;
+    p->ready    = false;
+    p->last_cr  = false;
+    p->machine  = false;                /* every attach starts in human mode */
+    p->attached = true;
 }
 
-bool console_rx(uint8_t b, bool error)
+void console_detach(con_port_t port)
 {
-    if (!s_bound) { return false; }
-    if (s_ready)
+    if ((unsigned)port < CON_PORT_COUNT) { s_port[port].attached = false; }
+}
+
+bool console_attached(con_port_t port)
+{
+    return (unsigned)port < CON_PORT_COUNT && s_port[port].attached;
+}
+
+void console_select(con_port_t port)
+{
+    if ((unsigned)port < CON_PORT_COUNT) { s_out = port; }
+}
+
+con_port_t console_current(void)              { return s_out; }
+void console_set_machine(bool on)             { s_port[s_out].machine = on; }
+bool console_machine(void)                    { return s_port[s_out].machine; }
+bool console_port_machine(con_port_t port)
+{
+    return (unsigned)port < CON_PORT_COUNT && s_port[port].machine;
+}
+
+static void echo(port_t *p, const char *s, uint16_t n)
+{
+    if (p->machine || !p->ops.echo) { return; }     /* the host does not want echo */
+    p->ops.echo(s, n);                  /* non-blocking: may be ISR context */
+}
+
+bool console_rx(con_port_t port, uint8_t b, bool error)
+{
+    if ((unsigned)port >= CON_PORT_COUNT) { return false; }
+    port_t *p = &s_port[port];
+    if (!p->attached) { return false; }
+    if (p->ready)
     {
-        echo("\a", 1u);                 /* busy: line not consumed yet */
+        echo(p, "\a", 1u);              /* busy: line not consumed yet */
         return false;
     }
     if (error) { return false; }
 
-    if (b == '\n' && s_last_cr) { s_last_cr = false; return false; }
-    s_last_cr = (b == '\r');
+    if (b == '\n' && p->last_cr) { p->last_cr = false; return false; }
+    p->last_cr = (b == '\r');
 
     if (b == '\r' || b == '\n')
     {
-        s_line[s_len] = '\0';
-        echo("\r\n", 2u);
-        s_ready = true;
+        p->line[p->len] = '\0';
+        echo(p, "\r\n", 2u);
+        p->ready = true;
         return true;
     }
     if (b == 0x08u || b == 0x7Fu)       /* backspace / DEL */
     {
-        if (s_len) { s_len--; echo("\b \b", 3u); }
+        if (p->len) { p->len--; echo(p, "\b \b", 3u); }
         return false;
     }
     if (b == 0x03u)                     /* Ctrl-C: drop the line */
     {
-        s_len = 0u;
-        echo("^C\r\n> ", 6u);
+        p->len = 0u;
+        echo(p, "^C\r\n> ", 6u);
         return false;
     }
     if (b < 0x20u || b > 0x7Eu) { return false; }
-    if (s_len >= CONSOLE_LINE_MAX) { echo("\a", 1u); return false; }
+    if (p->len >= CONSOLE_LINE_MAX) { echo(p, "\a", 1u); return false; }
 
-    s_line[s_len++] = (char)b;
-    echo((const char *)&b, 1u);
+    p->line[p->len++] = (char)b;
+    echo(p, (const char *)&b, 1u);
     return false;
 }
 
 bool console_pending(void)
 {
-    return s_ready;
+    uint8_t i;
+    for (i = 0u; i < CON_PORT_COUNT; i++)
+    {
+        if (s_port[i].attached && s_port[i].ready) { return true; }
+    }
+    return false;
 }
 
-void console_poll(void)
+static void run_line(port_t *p)
 {
-    if (!s_ready) { return; }
-
     char *argv[CONSOLE_ARGS_MAX];
     uint8_t argc = 0u;
-    char *p = s_line;
-    while (*p && argc < CONSOLE_ARGS_MAX)
+    char *c = p->line;
+    while (*c && argc < CONSOLE_ARGS_MAX)
     {
-        while (*p == ' ') { *p++ = '\0'; }
-        if (!*p) { break; }
-        argv[argc++] = p;
-        while (*p && *p != ' ') { p++; }
+        while (*c == ' ') { *c++ = '\0'; }
+        if (!*c) { break; }
+        argv[argc++] = c;
+        while (*c && *c != ' ') { c++; }
     }
 
     if (argc)
@@ -110,7 +148,7 @@ void console_poll(void)
         }
         if (!found)
         {
-            if (s_machine)
+            if (p->machine)
             {
                 con_puts("@err,"); con_puts(argv[0]); con_puts(",unknown"); con_nl();
             }
@@ -123,10 +161,34 @@ void console_poll(void)
             }
         }
     }
+}
 
-    s_len = 0u;
-    s_ready = false;                    /* accept input again */
-    con_prompt();
+void console_poll(void)
+{
+    uint8_t i;
+    for (i = 0u; i < CON_PORT_COUNT; i++)
+    {
+        port_t *p = &s_port[i];
+        if (!p->attached || !p->ready) { continue; }
+
+        con_port_t prev = s_out;
+        s_out = (con_port_t)i;          /* replies go back where the line came from */
+        run_line(p);
+        p->len = 0u;
+        p->ready = false;               /* accept input again */
+        if (p->attached)                /* a command may have detached it */
+        {
+            con_prompt();
+            if (p->ops.done) { p->ops.done(); }
+        }
+        s_out = prev;
+    }
+}
+
+void console_flush(void)
+{
+    port_t *p = &s_port[s_out];
+    if (p->attached && p->ops.flush) { p->ops.flush(); }
 }
 
 void console_help(void)
@@ -154,12 +216,14 @@ void console_help(void)
 
 void con_puts(const char *s)
 {
-    uart_write_all(s_uart, s, (uint16_t)strlen(s));
+    port_t *p = &s_port[s_out];
+    if (p->attached) { p->ops.write(s, (uint16_t)strlen(s)); }
 }
 
 void con_putc(char c)
 {
-    uart_write_all(s_uart, &c, 1u);
+    port_t *p = &s_port[s_out];
+    if (p->attached) { p->ops.write(&c, 1u); }
 }
 
 void con_nl(void)
@@ -169,7 +233,7 @@ void con_nl(void)
 
 void con_prompt(void)
 {
-    if (!s_machine) { con_puts("> "); }
+    if (!s_port[s_out].machine) { con_puts("> "); }
 }
 
 void con_u32(uint32_t v)

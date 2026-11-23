@@ -1,5 +1,13 @@
 # Logger console protocol (firmware 2.0)
 
+Two firmware variants share this protocol: the **UART logger** (build
+configurations Debug/Release; tag `v2.0` is the last UART-only firmware) and
+the **radio logger** (Debug_Radio/Release_Radio, `LOGGER_RADIO=1`), which
+offers the same console on a CC1101 radio as well. Both ports accept every
+command; each has its own mode (human/machine) and stream setting, and a
+reply always goes back to the port the command came from. The radio link is
+described at the end.
+
 The logger's command console on the LaunchPad backchannel UART, as used by
 people in a terminal (human mode) and by the dashboard (machine mode).
 
@@ -61,7 +69,7 @@ Offsets (below) are already applied to every reported VCC and temperature.
 
 | Line | When |
 |---|---|
-| `@boot,fw=2.0,why=<reason>,clock=<src>,boots=<n>` | in the banner after every start (both modes) |
+| `@boot,fw=2.0[,variant=radio],why=<reason>,clock=<src>,boots=<n>` | in the banner after every start (both modes) |
 | `@s,<t_s>,<vcc_mv>,<temp_dc>` | every 2 s sample while `stream on` |
 | `@sleep,<t_s>,<vcc_mv>` | machine mode: just before the logger enters deep sleep and the console stops (human mode prints a text line instead) |
 
@@ -90,6 +98,7 @@ Offsets (below) are already applied to every reported VCC and temperature.
 | `offset v <mv>` | VCC offset in mV, -200..200 | `@ok,offset,t=<dc>,v=<mv>` |
 | `erase yes` | clear counters, 16-sample log and history (settings kept) | `@ok,erase` |
 | `reset por\|bor` | software POR (RTC keeps running) or BOR (RTC cleared, restored from the log) | `@ok,reset,<por\|bor>`, then the device restarts |
+| `radio [s]` | radio build only: show or set the radio window period, 0 (off) or even 4..3600 s (default 60) | `@ok,radio,<s>,rf=<0\|1>` |
 
 Error codes: `unknown` (no such command), `args` (wrong arguments),
 `range` (value out of range), `fail` (the device could not do it, e.g. an
@@ -115,7 +124,9 @@ where noted (offsets).
 | `hfirst`, `hlast` | sequence numbers of the oldest and newest record (0 if empty) |
 | `interval`, `paused` | history interval in seconds, 1 if periodic records are paused |
 | `toff`, `voff` | temperature offset (0.1 C) and VCC offset (mV) |
-| `stream` | 1 if streaming |
+| `stream` | 1 if streaming on the port that asked |
+| `variant` | radio build only: `radio` (absent on the UART logger) |
+| `radio`, `rf` | radio build only: window period in s (0 = off); 1 if the CC1101 answered |
 
 ## History records
 
@@ -138,7 +149,7 @@ the newest 1600 records.
 | 7 | `pause` | 0 | reading when periodic logging paused |
 | 8 | `unpause` | 0 | reading when it resumed |
 | 9 | `mark` | bookmark code 0..255 | reading at the mark |
-| 10 | `config` | 1 interval, 2 temp offset, 3 VCC offset | new value in `vcc_mv` (interval s) or as a signed 16-bit value in the field of its unit (offset t in `temp_dc`, offset v in `vcc_mv` read as int16); other field missing |
+| 10 | `config` | 1 interval, 2 temp offset, 3 VCC offset, 4 radio period (radio build) | new value in `vcc_mv` (interval s) or as a signed 16-bit value in the field of its unit (offset t in `temp_dc`, offset v in `vcc_mv` read as int16); other field missing |
 
 `hist` in human mode prints the same records as CSV with the header
 `seq,t_s,time,event,detail,vcc_mv,temp_c` (the format of the report's
@@ -169,3 +180,72 @@ defaults are used: interval 120 s, not paused, offsets 0.
 The VCC offset also applies to the deep-sleep decision (2.2 V / 2.6 V),
 since it is a calibration of the reading; the range is limited to ±200 mV
 for that reason.
+
+## Radio link (radio build)
+
+The radio logger carries the same console over a CC1101 at 433.92 MHz,
+GFSK 1.2 kBaud, 0 dBm (the `cc1101_radio` settings: variable-length packets
+with the CC1101's CRC, address check off). The radio is a byte stream like
+the UART: the console text inside the packets is exactly what the UART would
+carry, so a host can feed it to the same parser.
+
+### Packets
+
+Each packet's payload (after the CC1101 length byte) is:
+
+| Byte | Field |
+|---|---|
+| 0 | destination address: `0x00` host, `0x01` logger |
+| 1 | source address |
+| 2 | control: bits 7-6 type (`00` DATA, `01` ACK, `10` BEACON), bits 3-0 sequence |
+| 3..60 | text, up to 58 bytes (DATA and BEACON only) |
+
+Packets with a bad CRC, or not addressed from the host to the logger, are
+ignored by the logger.
+
+### Timing (the logger's side)
+
+1. The CC1101 sleeps. Every radio period (`radio`, default 60 s, 0 = off)
+   the logger wakes it and sends one or more **BEACON** packets. Their text is
+   the asynchronous output queued since the last window: `@boot` after a
+   start, `@s` with the latest sample if `stream on` was set *over the
+   radio*. Up to 128 bytes wait between windows; more is dropped.
+2. It then listens for **300 ms** (extended once, up to 1 s more, if a packet
+   is already arriving when the 300 ms end).
+3. A host sends a **DATA** packet holding one command line, ending in CR.
+   The logger answers with an **ACK** carrying the same sequence number
+   (sent again if the host repeats the DATA; the command runs only once),
+   runs the command, and sends the reply text as **DATA** packets with its
+   own sequence numbers (mod 16). The host must **ACK each one within
+   250 ms**; the logger retries 3 times, then drops the rest of the reply.
+4. After a reply the logger listens for another 300 ms, so a host can send
+   the next command at once. A window that passes without a packet for the
+   logger puts the CC1101 back to sleep.
+5. Before deep sleep the logger sends one last BEACON with `@sleep,...`
+   (no listening). Minute check-ins in deep sleep do not use the radio.
+
+As on the UART, one command at a time: wait for the reply terminator
+(`@ok`/`@err` in machine mode, the prompt in human mode) before the next one.
+The radio port starts in human mode after every boot; send `mode m` over the
+radio for tagged replies.
+
+### Throughput and energy
+
+- A full 58-byte DATA packet is on air for about 480 ms; with the ACK, a
+  reply moves at roughly 80 bytes/s. A `hist since <seq> 100` chunk
+  (~3 KB in machine mode) takes about 40 s.
+- An empty window (wake, a 3-byte beacon of ~93 ms, 300 ms of RX at about
+  15-16 mA) costs roughly **6 mC**. Averaged over the period:
+
+| Period | Average radio current | Logging time from 3.1 V (0.2 C usable) |
+|---|---|---|
+| 60 s (default) | ~100 uA | ~0.5 h |
+| 300 s | ~20 uA | ~2.5 h |
+| 600 s | ~10 uA | ~4 h |
+| off | 0 | ~16-18 h (T13) |
+
+  The logger alone draws about 3 uA (test report, T12/T13), so on the
+  supercapacitor the radio dominates unless the period is long. On USB
+  power any period is fine. A faster data rate (e.g. a 38.4 kBaud SmartRF
+  preset) would shorten every packet about 30-fold, at some cost in range.
+

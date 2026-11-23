@@ -14,7 +14,7 @@ typedef struct
 } stored_t;
 
 #pragma PERSISTENT(s_stored)
-static stored_t s_stored = { { 0u, 0u, 0u, 0, 0 }, 0u, 0u };
+static stored_t s_stored = { { 0u, 0u, 0u, 0, 0, 0u }, 0u, 0u };
 
 static settings_t s_cur;
 
@@ -29,7 +29,10 @@ static bool valid(const settings_t *s)
            s->interval_s >= SET_INTERVAL_MIN && s->interval_s <= SET_INTERVAL_MAX &&
            (s->interval_s & 1u) == 0u &&
            s->toff_dc >= -SET_TOFF_LIMIT && s->toff_dc <= SET_TOFF_LIMIT &&
-           s->voff_mv >= -SET_VOFF_LIMIT && s->voff_mv <= SET_VOFF_LIMIT;
+           s->voff_mv >= -SET_VOFF_LIMIT && s->voff_mv <= SET_VOFF_LIMIT &&
+           (s->radio_period_s == 0u ||
+            (s->radio_period_s >= SET_RADIO_MIN && s->radio_period_s <= SET_RADIO_MAX &&
+             (s->radio_period_s & 1u) == 0u));
 }
 
 void settings_init(void)
@@ -44,6 +47,7 @@ void settings_init(void)
     s_cur.reserved   = 0u;
     s_cur.toff_dc    = 0;
     s_cur.voff_mv    = 0;
+    s_cur.radio_period_s = SET_RADIO_DEFAULT;
 }
 
 const settings_t *settings(void)
@@ -60,6 +64,7 @@ static void store(void)
     p->s.reserved   = 0u;
     p->s.toff_dc    = s_cur.toff_dc;
     p->s.voff_mv    = s_cur.voff_mv;
+    p->s.radio_period_s = s_cur.radio_period_s;
     p->crc  = crc_of(&s_cur);           /* 3. CRC */
     p->mark = SET_MARK;                 /* 4. commit */
 }
@@ -90,6 +95,17 @@ bool settings_set_voff(int16_t mv)
 {
     if (mv < -SET_VOFF_LIMIT || mv > SET_VOFF_LIMIT) { return false; }
     s_cur.voff_mv = mv;
+    store();
+    return true;
+}
+
+bool settings_set_radio(uint16_t period_s)
+{
+    if (period_s != 0u && (period_s < SET_RADIO_MIN || period_s > SET_RADIO_MAX || (period_s & 1u)))
+    {
+        return false;
+    }
+    s_cur.radio_period_s = period_s;
     store();
     return true;
 }

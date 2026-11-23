@@ -49,6 +49,23 @@
 #include "app/settings.h"
 
 /*
+ * Build variant. 0: UART logger (Debug, Release). 1: radio logger, the same
+ * logger with the console also on a CC1101 (Debug_Radio, Release_Radio,
+ * which define LOGGER_RADIO=1). The UART-only firmware 2.0 is tag v2.0.
+ */
+#ifndef LOGGER_RADIO
+#define LOGGER_RADIO    0
+#endif
+#if LOGGER_RADIO
+#include "app/radio_link.h"
+#define FW_VARIANT      ",variant=radio"
+#define RADIO_PENDING() radio_link_pending()
+#else
+#define FW_VARIANT      ""
+#define RADIO_PENDING() false
+#endif
+
+/*
  * Long history (app/history.c): one record per history interval (2 min
  * by default, settable with the interval command, app/settings.c) while
  * logging and not paused, plus boot, deep-sleep, check-in, resume, mark
@@ -174,6 +191,9 @@ static bool on_rtc(rtc_event_t ev)
 /* Runs inside board_init() before LOCKLPM5 is cleared (RTC rule for LPMx.5) */
 static void before_unlock(void)
 {
+#if LOGGER_RADIO
+    radio_link_pins_safe();             /* CC1101 stays asleep: CSn high */
+#endif
     s_rtc_kept = rtc_init(NULL, on_rtc);
     rtc_set_periodic(RTC_PERIOD_2S);
     rtc_set_time_event(RTC_TEV_OFF);
@@ -393,7 +413,7 @@ static inline void lpm35_on_resume(void) { }
 
 static uint8_t           s_con_tx[256];
 static bool              s_con_up;
-static bool              s_stream;          /* print every sample */
+static bool              s_stream[CON_PORT_COUNT];  /* print every sample, per port */
 static pmm_boot_reason_t s_why;
 
 static const char *const k_why[] = { "power-on", "LPMx.5 wake", "reset pin", "watchdog", "software", "fault" };
@@ -520,6 +540,7 @@ static void con_rec(const hist_rec_t *r)
         if (r->arg == HIST_CFG_INTERVAL)  { con_puts("interval "); con_u32(r->vcc_mv); con_puts(" s"); }
         else if (r->arg == HIST_CFG_TOFF) { con_puts("temp offset "); con_dec1(r->temp_dc); con_puts(" C"); }
         else if (r->arg == HIST_CFG_VOFF) { con_puts("vcc offset "); con_i32((int16_t)r->vcc_mv); con_puts(" mV"); }
+        else if (r->arg == HIST_CFG_RADIO) { con_puts("radio period "); con_u32(r->vcc_mv); con_puts(" s"); }
         break;
     default:
         break;
@@ -551,7 +572,7 @@ static void cmd_status(uint8_t argc, char *argv[])
 
     if (console_machine())
     {
-        con_puts("@status,fw=" FW_PROTO ",t="); con_u32(now_s());
+        con_puts("@status,fw=" FW_PROTO FW_VARIANT ",t="); con_u32(now_s());
         con_puts(",clock="); con_puts(k_clock_tag[s_clock]);
         con_puts(",boots="); con_u32(g_state.boots);
         con_puts(",why="); con_puts(why_tag());
@@ -572,7 +593,11 @@ static void cmd_status(uint8_t argc, char *argv[])
         con_puts(",paused="); con_u32(st->paused);
         con_puts(",toff="); con_i32(st->toff_dc);
         con_puts(",voff="); con_i32(st->voff_mv);
-        con_puts(",stream="); con_u32(s_stream ? 1u : 0u);
+        con_puts(",stream="); con_u32(s_stream[console_current()] ? 1u : 0u);
+#if LOGGER_RADIO
+        con_puts(",radio="); con_u32(st->radio_period_s);
+        con_puts(",rf="); con_u32(radio_link_ok() ? 1u : 0u);
+#endif
         con_nl();
         reply_ok("status");
         return;
@@ -603,6 +628,12 @@ static void cmd_status(uint8_t argc, char *argv[])
     con_puts("logging   history every "); con_u32(st->interval_s); con_puts(" s");
     con_puts(st->paused ? " (PAUSED)" : "");
     con_puts(", offsets "); con_dec1(st->toff_dc); con_puts(" C, "); con_i32(st->voff_mv); con_puts(" mV"); con_nl();
+#if LOGGER_RADIO
+    con_puts("radio     ");
+    if (st->radio_period_s) { con_puts("window every "); con_u32(st->radio_period_s); con_puts(" s"); }
+    else                    { con_puts("off"); }
+    con_puts(radio_link_ok() ? ", CC1101 OK" : ", CC1101 not found"); con_nl();
+#endif
 }
 
 static void cmd_hist(uint8_t argc, char *argv[])
@@ -719,12 +750,13 @@ static void cmd_time(uint8_t argc, char *argv[])
 
 static void cmd_stream(uint8_t argc, char *argv[])
 {
-    if (argc == 2u && strcmp(argv[1], "on") == 0)  { s_stream = true; }
-    else if (argc == 2u && strcmp(argv[1], "off") == 0) { s_stream = false; }
+    bool *on = &s_stream[console_current()];
+    if (argc == 2u && strcmp(argv[1], "on") == 0)  { *on = true; }
+    else if (argc == 2u && strcmp(argv[1], "off") == 0) { *on = false; }
     else if (argc != 1u) { reply_err("stream", "args", "expected: stream [on|off]"); return; }
-    if (console_machine()) { con_puts("@ok,stream,"); con_puts(s_stream ? "on" : "off"); con_nl(); return; }
-    con_puts("stream "); con_puts(s_stream ? "on" : "off"); con_nl();
-    if (s_stream) { con_puts("t_s,time,vcc_mv,temp_c"); con_nl(); }
+    if (console_machine()) { con_puts("@ok,stream,"); con_puts(*on ? "on" : "off"); con_nl(); return; }
+    con_puts("stream "); con_puts(*on ? "on" : "off"); con_nl();
+    if (*on) { con_puts("t_s,time,vcc_mv,temp_c"); con_nl(); }
 }
 
 static void cmd_erase(uint8_t argc, char *argv[])
@@ -887,10 +919,47 @@ static void cmd_reset(uint8_t argc, char *argv[])
     else                   { con_puts(bor ? "software BOR..." : "software POR..."); }
     con_nl();
     state_save();
-    (void)uart_flush(CON_UART);
+    console_flush();                    /* the reply leaves on its own port */
+    if (s_con_up) { (void)uart_flush(CON_UART); }
     if (bor) { pmm_software_bor(); } else { pmm_software_por(); }
 }
 
+
+
+#if LOGGER_RADIO
+static void cmd_radio(uint8_t argc, char *argv[])
+{
+    if (argc == 2u)
+    {
+        uint32_t s;
+        if (!con_parse_u32(argv[1], 65535u, &s))
+        {
+            reply_err("radio", "args", "expected: radio [s] (0 = off, even 4..3600)");
+            return;
+        }
+        if (s != settings()->radio_period_s)
+        {
+            if (!settings_set_radio((uint16_t)s))
+            {
+                reply_err("radio", "range", "radio period: 0 (off) or even 4..3600 s");
+                return;
+            }
+            hist_append(HIST_CONFIG, HIST_CFG_RADIO, now_s(), (uint16_t)s, HIST_NO_TEMP);
+        }
+    }
+    else if (argc != 1u) { reply_err("radio", "args", "expected: radio [s]"); return; }
+
+    uint16_t p = settings()->radio_period_s;
+    if (console_machine())
+    {
+        con_puts("@ok,radio,"); con_u32(p); con_puts(",rf="); con_u32(radio_link_ok() ? 1u : 0u); con_nl();
+        return;
+    }
+    if (p) { con_puts("radio window every "); con_u32(p); con_puts(" s"); }
+    else   { con_puts("radio off"); }
+    con_puts(radio_link_ok() ? ", CC1101 OK" : ", CC1101 not found"); con_nl();
+}
+#endif
 
 static const console_cmd_t k_cmds[] =
 {
@@ -908,13 +977,28 @@ static const console_cmd_t k_cmds[] =
     { "offset",   "[t dC | v mV]",         "sensor offsets (0.1 C, mV)",             cmd_offset   },
     { "mode",     "[h|m]",                 "human or machine replies",               cmd_mode     },
     { "reset",    "por|bor",               "software reset (POR keeps the RTC)",     cmd_reset    },
+#if LOGGER_RADIO
+    { "radio",    "[s]",                   "radio window period, 0 = off",           cmd_radio    },
+#endif
     { "erase",    "yes",                   "clear counters, log, history (like S2)", cmd_erase    },
 };
 
 static bool on_uart_rx(uart_id_t id, uint8_t byte, bool error)
 {
     (void)id;
-    return console_rx(byte, error);
+    return console_rx(CON_PORT_UART, byte, error);
+}
+
+static void uart_out(const char *s, uint16_t n)  { uart_write_all(CON_UART, s, n); }
+static void uart_echo(const char *s, uint16_t n) { (void)uart_write(CON_UART, s, n); }   /* ISR-safe */
+static void uart_wait(void)                      { (void)uart_flush(CON_UART); }
+
+/* "@boot,..." line for the current port */
+static void con_boot_line(void)
+{
+    con_puts("@boot,fw=" FW_PROTO FW_VARIANT ",why="); con_puts(why_tag());
+    con_puts(",clock="); con_puts(k_clock_tag[s_clock]);
+    con_puts(",boots="); con_u32(g_state.boots); con_nl();
 }
 
 static void console_start(cs_status_t cs)
@@ -926,13 +1010,16 @@ static void console_start(cs_status_t cs)
         s_con_tx, sizeof s_con_tx,
         on_uart_rx
     };
+    console_init(k_cmds, (uint8_t)(sizeof k_cmds / sizeof k_cmds[0]));
     board_uart_pins(true);
     if (!uart_init(CON_UART, &cfg))
     {
         board_uart_pins(false);
         return;
     }
-    console_init(CON_UART, k_cmds, (uint8_t)(sizeof k_cmds / sizeof k_cmds[0]));
+    static const con_port_ops_t k_uart_ops = { uart_out, uart_echo, NULL, uart_wait };
+    console_attach(CON_PORT_UART, &k_uart_ops);
+    console_select(CON_PORT_UART);
     s_con_up = true;
 
     con_nl();
@@ -942,9 +1029,7 @@ static void console_start(cs_status_t cs)
     if (cs == CS_LFXT_FAULT) { con_puts(", crystal FAILED (UART on DCO)"); }
     con_nl();
     con_puts("type help for commands"); con_nl();
-    con_puts("@boot,fw=" FW_PROTO ",why="); con_puts(why_tag());
-    con_puts(",clock="); con_puts(k_clock_tag[s_clock]);
-    con_puts(",boots="); con_u32(g_state.boots); con_nl();
+    con_boot_line();
     con_prompt();
 }
 
@@ -952,6 +1037,7 @@ static void console_stop(void)
 {
     if (!s_con_up) { return; }
     (void)uart_flush(CON_UART);
+    console_detach(CON_PORT_UART);
     uart_deinit(CON_UART);
     board_uart_pins(false);
     s_con_up = false;
@@ -963,6 +1049,14 @@ static void enter_deep_sleep(uint16_t mv)
 {
     g_state.deep_sleeps++;
     state_save();
+
+#if LOGGER_RADIO
+    /* Last word over the radio, sent at once (no window), then the chip sleeps */
+    console_select(CON_PORT_RADIO);
+    con_puts("@sleep,"); con_u32(now_s()); con_putc(','); con_u32(mv); con_nl();
+    console_select(CON_PORT_UART);
+    radio_link_shutdown();
+#endif
 
     if (s_con_up)
     {
@@ -1373,6 +1467,16 @@ int main(void)
 #if !CONSOLE_E10_TEST
     console_start(cs);
 #endif
+#if LOGGER_RADIO
+    if (!radio_link_init() && s_con_up)
+    {
+        con_puts("CC1101 not found: radio console off until it answers"); con_nl();
+        con_prompt();
+    }
+    console_select(CON_PORT_RADIO);     /* announced in the first beacon */
+    con_boot_line();
+    console_select(CON_PORT_UART);
+#endif
 
     wdt_start_watchdog(WDT_CLK_ACLK, WDT_DIV_512K);     /* 16 s at 32 kHz */
     s_sample_due = true;                                /* first sample now */
@@ -1401,16 +1505,17 @@ int main(void)
                 if (s_e10 == E10_PHASE_SAMPLES + 1u) { console_start(cs); }
                 if (s_e10 == 2u * E10_PHASE_SAMPLES + 1u && s_con_up)
                 {
-                    s_stream = true;
+                    s_stream[CON_PORT_UART] = true;
                     con_puts("stream on (E10 phase 3)"); con_nl();
                     con_puts("t_s,time,vcc_mv,temp_c"); con_nl();
                 }
             }
 #endif
             if (new_pass) { flash(false, 1u, SAMPLE_FLASH_MS, 0u); }
-            if (s_stream && s_con_up && g_state.log_count)
+            if (s_stream[CON_PORT_UART] && s_con_up && g_state.log_count)
             {
                 const log_entry_t *e = &g_state.log[(g_state.log_head + LOG_LEN - 1u) % LOG_LEN];
+                console_select(CON_PORT_UART);
                 if (console_machine())
                 {
                     con_puts("@s,"); con_u32(e->t); con_putc(','); con_u32(e->vcc_mv);
@@ -1421,8 +1526,30 @@ int main(void)
                     con_log_line(e);
                 }
             }
+#if LOGGER_RADIO
+            if (radio_link_due(settings()->radio_period_s))
+            {
+                /* streaming over the radio: the latest sample rides on the beacon */
+                if (s_stream[CON_PORT_RADIO] && g_state.log_count)
+                {
+                    const log_entry_t *e = &g_state.log[(g_state.log_head + LOG_LEN - 1u) % LOG_LEN];
+                    console_select(CON_PORT_RADIO);
+                    con_puts("@s,"); con_u32(e->t); con_putc(','); con_u32(e->vcc_mv);
+                    con_putc(','); con_i32(e->temp_dc); con_nl();
+                    console_select(CON_PORT_UART);
+                }
+                radio_link_open();
+            }
+#endif
         }
 
+#if LOGGER_RADIO
+        if (radio_link_pending())
+        {
+            wdt_kick();
+            radio_link_service();
+        }
+#endif
         if (console_pending())
         {
             wdt_kick();
@@ -1449,7 +1576,7 @@ int main(void)
         /* Sleep unless an event arrived while we were busy */
         uint16_t sr = __get_SR_register();
         __disable_interrupt();
-        if (!s_sample_due && !s_s1_event && !s_s2_event && !console_pending())
+        if (!s_sample_due && !s_s1_event && !s_s2_event && !console_pending() && !RADIO_PENDING())
         {
             pmm_enter_lpm(PMM_LPM3);        /* sets GIE atomically with LPM bits */
         }

@@ -1,6 +1,8 @@
 # CCS build output
 Debug/
 Release/
+Debug_Radio/
+Release_Radio/
 *.obj
 *.out
 *.map

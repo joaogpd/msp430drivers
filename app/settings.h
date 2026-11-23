@@ -22,6 +22,9 @@
 #define SET_INTERVAL_MAX        (3600u)
 #define SET_TOFF_LIMIT          (100)   /* |temperature offset| <= 10.0 C */
 #define SET_VOFF_LIMIT          (200)   /* |VCC offset| <= 200 mV */
+#define SET_RADIO_DEFAULT       (60u)   /* radio window period, s (radio build) */
+#define SET_RADIO_MIN           (4u)
+#define SET_RADIO_MAX           (3600u)
 
 typedef struct
 {
@@ -30,6 +33,7 @@ typedef struct
     uint8_t  reserved;      /* 0; keeps the struct free of padding for the CRC */
     int16_t  toff_dc;       /* added to every temperature, 0.1 C */
     int16_t  voff_mv;       /* added to every VCC reading, mV */
+    uint16_t radio_period_s;/* radio window every n s, 0 = off (radio build) */
 } settings_t;
 
 /* Load the stored copy, or the defaults if it is invalid. Call once per boot. */
@@ -43,5 +47,6 @@ bool settings_set_interval(uint16_t s);
 void settings_set_paused(bool paused);
 bool settings_set_toff(int16_t dc);
 bool settings_set_voff(int16_t mv);
+bool settings_set_radio(uint16_t period_s);   /* 0, or even SET_RADIO_MIN..MAX */
 
 #endif /* APP_SETTINGS_H_ */
