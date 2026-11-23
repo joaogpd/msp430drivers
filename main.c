@@ -27,7 +27,9 @@
  * Console (layer 3): the backchannel UART (eUSCI_A0, P2.0/P2.1) at
  * 9600 8N1 on the "MSP Application UART1" COM port. Clocked from the
  * 32 kHz crystal, so it works while the CPU sleeps in LPM3. Commands:
- * help, status, log, time, stream, erase (see k_cmds below). It is not
+ * help, status, log, hist, time, stream, erase, and for the dashboard mode,
+ * snap, pause, resume, interval, mark, offset, reset (see k_cmds below and
+ * docs/console_protocol.md for the machine-mode replies). It is not
  * started on LPM3.5 check-ins and is shut down before deep sleep.
  */
 #include <msp430.h>
@@ -44,14 +46,16 @@
 #include "drivers/msp430/uart.h"
 #include "app/console.h"
 #include "app/history.h"
+#include "app/settings.h"
 
 /*
- * Long history (app/history.c): one record every HIST_EVERY_SAMPLES
- * samples (2 min) while logging, plus boot, deep-sleep, check-in and
- * resume events. 1600 records cover a full supercap discharge (~21 h of
+ * Long history (app/history.c): one record per history interval (2 min
+ * by default, settable with the interval command, app/settings.c) while
+ * logging and not paused, plus boot, deep-sleep, check-in, resume, mark
+ * and settings events. 1600 records cover a full supercap discharge (~21 h of
  * logging at 2 min, then ~8 h of minute check-ins).
  */
-#define HIST_EVERY_SAMPLES  (60u)
+#define FW_PROTO            "2.0"     /* console protocol version */
 #define HIST_NO_TEMP        (-32768)    /* temp_dc when not measured */
 
 /* Where the RTC time came from at this boot */
@@ -185,6 +189,25 @@ static uint32_t now_s(void)
     if (!rtc_get_time(&t)) { return 0; }
     uint32_t e = rtc_to_epoch(&t);
     return (e >= EPOCH_2026) ? e - EPOCH_2026 : 0u;
+}
+
+/* Readings with the sensor offsets applied (app/settings.c). The VCC
+   offset is a calibration, so the deep-sleep decision uses it too. */
+static bool read_vcc(uint16_t *mv)
+{
+    uint16_t raw;
+    if (adc_read_vcc_mv(&raw) != ADC_OK) { return false; }
+    int32_t v = (int32_t)raw + settings()->voff_mv;
+    *mv = (uint16_t)((v < 1) ? 1 : v);
+    return true;
+}
+
+static bool read_temp(int16_t *dc)
+{
+    int16_t raw;
+    if (adc_read_temp_dc(&raw) != ADC_OK) { return false; }
+    *dc = (int16_t)(raw + settings()->toff_dc);
+    return true;
 }
 
 /* ------------------------------------------------------------ buttons */
@@ -374,6 +397,18 @@ static bool              s_stream;          /* print every sample */
 static pmm_boot_reason_t s_why;
 
 static const char *const k_why[] = { "power-on", "LPMx.5 wake", "reset pin", "watchdog", "software", "fault" };
+static const char *const k_why_tag[] = { "power-on", "lpm5-wake", "reset-pin", "watchdog", "software", "fault" };
+static const char *const k_clock_tag[] = { "kept", "restored", "default", "set" };
+
+/* Machine-mode boot reason; software resets are told apart as POR / BOR */
+static const char *why_tag(void)
+{
+    if (s_why == PMM_BOOT_SOFTWARE)
+    {
+        return (pmm_reset_flags() & PMM_RST_SWBOR) ? "sw-bor" : "sw-por";
+    }
+    return k_why_tag[s_why];
+}
 
 static void erase_state(void)
 {
@@ -407,10 +442,100 @@ static void con_log_line(const log_entry_t *e)
     con_nl();
 }
 
+/* ------------------------------------------------ console: replies */
+
+/* Error reply: "@err,<cmd>,<code>" in machine mode, the text otherwise */
+static void reply_err(const char *cmd, const char *code, const char *human)
+{
+    if (console_machine())
+    {
+        con_puts("@err,"); con_puts(cmd); con_putc(','); con_puts(code);
+    }
+    else
+    {
+        con_puts(human);
+    }
+    con_nl();
+}
+
+/* "@ok,<cmd>" (no fields) in machine mode; nothing in human mode */
+static void reply_ok(const char *cmd)
+{
+    if (console_machine()) { con_puts("@ok,"); con_puts(cmd); con_nl(); }
+}
+
+/* Signed decimal with an optional leading '-', |value| <= 32767 */
+static bool parse_i16(const char *s, int16_t *out)
+{
+    bool neg = (*s == '-');
+    uint32_t v;
+    if (!con_parse_u32(neg ? s + 1 : s, 32767u, &v)) { return false; }
+    *out = (int16_t)(neg ? -(int32_t)v : (int32_t)v);
+    return true;
+}
+
+/* Current readings for event records; missing ones use the sentinels */
+static void read_now(uint16_t *mv, int16_t *dc)
+{
+    if (!read_vcc(mv))  { *mv = 0u; }
+    if (!read_temp(dc)) { *dc = HIST_NO_TEMP; }
+}
+
+/* One history record: "@h,..." in machine mode, a CSV row otherwise */
+static void con_rec(const hist_rec_t *r)
+{
+    if (console_machine())
+    {
+        con_puts("@h,");
+        con_u32(r->seq);  con_putc(',');
+        con_u32(r->t);    con_putc(',');
+        con_u32(r->kind); con_putc(',');
+        con_u32(r->arg);  con_putc(',');
+        con_u32(r->vcc_mv); con_putc(',');
+        con_i32(r->temp_dc);
+        con_nl();
+        return;
+    }
+
+    bool readings = true;
+    con_u32(r->seq);       con_putc(',');
+    con_u32(r->t);         con_putc(',');
+    con_time(r->t);        con_putc(',');
+    con_puts(hist_kind_name(r->kind)); con_putc(',');
+    switch (r->kind)
+    {
+    case HIST_BOOT:
+        if ((r->arg & 0x0Fu) < (sizeof k_why / sizeof k_why[0])) { con_puts(k_why[r->arg & 0x0Fu]); }
+        if ((r->arg & 0x0Fu) == (uint8_t)PMM_BOOT_SOFTWARE)
+        {
+            con_puts((r->arg & HIST_BOOT_SWBOR) ? " BOR" : " POR");
+        }
+        if (r->arg & HIST_BOOT_RESTORED) { con_puts(" (clock restored)"); }
+        break;
+    case HIST_MARK:
+        con_puts("code "); con_u32(r->arg);
+        break;
+    case HIST_CONFIG:
+        readings = false;
+        if (r->arg == HIST_CFG_INTERVAL)  { con_puts("interval "); con_u32(r->vcc_mv); con_puts(" s"); }
+        else if (r->arg == HIST_CFG_TOFF) { con_puts("temp offset "); con_dec1(r->temp_dc); con_puts(" C"); }
+        else if (r->arg == HIST_CFG_VOFF) { con_puts("vcc offset "); con_i32((int16_t)r->vcc_mv); con_puts(" mV"); }
+        break;
+    default:
+        break;
+    }
+    con_putc(',');
+    if (readings && r->vcc_mv) { con_u32(r->vcc_mv); }
+    con_putc(',');
+    if (readings && r->temp_dc != HIST_NO_TEMP) { con_dec1(r->temp_dc); }
+    con_nl();
+}
+
 static void cmd_help(uint8_t argc, char *argv[])
 {
     (void)argc; (void)argv;
     console_help();
+    reply_ok("help");
 }
 
 static void cmd_status(uint8_t argc, char *argv[])
@@ -418,8 +543,40 @@ static void cmd_status(uint8_t argc, char *argv[])
     (void)argc; (void)argv;
     uint16_t mv = 0;
     int16_t  dc = 0;
-    bool v_ok = adc_read_vcc_mv(&mv) == ADC_OK;
-    bool t_ok = adc_read_temp_dc(&dc) == ADC_OK;
+    bool v_ok = read_vcc(&mv);
+    bool t_ok = read_temp(&dc);
+    uint16_t hc = hist_count(), hl = 0u;
+    bool have = hist_newest_seq(&hl);
+    const settings_t *st = settings();
+
+    if (console_machine())
+    {
+        con_puts("@status,fw=" FW_PROTO ",t="); con_u32(now_s());
+        con_puts(",clock="); con_puts(k_clock_tag[s_clock]);
+        con_puts(",boots="); con_u32(g_state.boots);
+        con_puts(",why="); con_puts(why_tag());
+        con_puts(",plosses="); con_u32(g_state.power_losses);
+        con_puts(",sleeps="); con_u32(g_state.deep_sleeps);
+        con_puts(",samples="); con_u32(g_state.samples);
+        con_puts(",vcc="); con_u32(v_ok ? mv : 0u);
+        con_puts(",vmin="); con_u32(g_state.min_vcc_mv == 0xFFFFu ? 0u : g_state.min_vcc_mv);
+        con_puts(",vlow="); con_u32(VCC_LOW_MV);
+        con_puts(",vresume="); con_u32(VCC_RESUME_MV);
+        con_puts(",temp="); con_i32(t_ok ? dc : HIST_NO_TEMP);
+        con_puts(",ckpt="); con_u32(s_ckpt_ok ? 1u : 0u);
+        con_puts(",hcount="); con_u32(hc);
+        con_puts(",hlen="); con_u32(HIST_LEN);
+        con_puts(",hfirst="); con_u32(have ? (uint16_t)(hl - hc + 1u) : 0u);
+        con_puts(",hlast="); con_u32(have ? hl : 0u);
+        con_puts(",interval="); con_u32(st->interval_s);
+        con_puts(",paused="); con_u32(st->paused);
+        con_puts(",toff="); con_i32(st->toff_dc);
+        con_puts(",voff="); con_i32(st->voff_mv);
+        con_puts(",stream="); con_u32(s_stream ? 1u : 0u);
+        con_nl();
+        reply_ok("status");
+        return;
+    }
 
     con_puts("time      "); con_time(now_s());
     con_puts(" ("); con_puts(k_clock[s_clock]); con_puts(")"); con_nl();
@@ -440,42 +597,62 @@ static void cmd_status(uint8_t argc, char *argv[])
     con_puts("storage   ");
     con_puts(s_ckpt_ok ? "checkpoints on" : "CRC self-test failed, checkpoints off");
     con_puts(", log "); con_u32(g_state.log_count); con_puts("/"); con_u32(LOG_LEN);
-    con_puts(", history "); con_u32(hist_count()); con_puts("/"); con_u32(HIST_LEN); con_nl();
+    con_puts(", history "); con_u32(hc); con_puts("/"); con_u32(HIST_LEN);
+    if (have) { con_puts(" (#"); con_u32((uint16_t)(hl - hc + 1u)); con_puts("..#"); con_u32(hl); con_puts(")"); }
+    con_nl();
+    con_puts("logging   history every "); con_u32(st->interval_s); con_puts(" s");
+    con_puts(st->paused ? " (PAUSED)" : "");
+    con_puts(", offsets "); con_dec1(st->toff_dc); con_puts(" C, "); con_i32(st->voff_mv); con_puts(" mV"); con_nl();
 }
 
 static void cmd_hist(uint8_t argc, char *argv[])
 {
     uint16_t count = hist_count();
-    uint32_t n = count;
-    if (argc == 2u && !con_parse_u32(argv[1], 65535u, &n))
+    uint16_t first, last = count;           /* records [first, last) */
+    uint32_t v;
+
+    if (argc >= 2u && strcmp(argv[1], "since") == 0)
     {
-        con_puts("expected: hist [n] (newest n records)"); con_nl();
+        uint32_t max = 100u;
+        if (argc < 3u || argc > 4u || !con_parse_u32(argv[2], 65535u, &v) ||
+            (argc == 4u && (!con_parse_u32(argv[3], 400u, &max) || max == 0u)))
+        {
+            reply_err("hist", "args", "expected: hist since <seq> [max 1..400]");
+            return;
+        }
+        first = hist_index_after((uint16_t)v, count);
+        if ((uint32_t)(count - first) > max) { last = (uint16_t)(first + max); }
+    }
+    else if (argc <= 2u)
+    {
+        v = count;
+        if (argc == 2u && !con_parse_u32(argv[1], 65535u, &v))
+        {
+            reply_err("hist", "args", "expected: hist [n] or hist since <seq> [max]");
+            return;
+        }
+        if (v > count) { v = count; }
+        first = (uint16_t)(count - v);
+    }
+    else
+    {
+        reply_err("hist", "args", "expected: hist [n] or hist since <seq> [max]");
         return;
     }
-    if (argc > 2u) { con_puts("expected: hist [n]"); con_nl(); return; }
-    if (n > count) { n = count; }
 
-    con_puts("seq,t_s,time,event,detail,vcc_mv,temp_c"); con_nl();
-    uint16_t i;
-    for (i = (uint16_t)(count - n); i < count; i++)
+    if (!console_machine()) { con_puts("seq,t_s,time,event,detail,vcc_mv,temp_c"); con_nl(); }
+    uint16_t i, sent = 0u;
+    for (i = first; i < last; i++)
     {
         hist_rec_t r;
         if (!hist_get(i, count, &r)) { continue; }
-        con_u32(r.seq);        con_putc(',');
-        con_u32(r.t);          con_putc(',');
-        con_time(r.t);         con_putc(',');
-        con_puts(hist_kind_name(r.kind)); con_putc(',');
-        if (r.kind == HIST_BOOT)
-        {
-            con_puts(k_why[r.arg & 0x0Fu]);
-            if (r.arg & 0x80u) { con_puts(" (clock restored)"); }
-        }
-        con_putc(',');
-        if (r.vcc_mv) { con_u32(r.vcc_mv); }
-        con_putc(',');
-        if (r.temp_dc != HIST_NO_TEMP) { con_dec1(r.temp_dc); }
-        con_nl();
+        con_rec(&r);
+        sent++;
         wdt_kick();
+    }
+    if (console_machine())
+    {
+        con_puts("@ok,hist,"); con_u32(sent); con_putc(','); con_u32((uint32_t)(count - last)); con_nl();
     }
 }
 
@@ -491,6 +668,7 @@ static void cmd_log(uint8_t argc, char *argv[])
         i = (uint8_t)((i + 1u) % LOG_LEN);
         wdt_kick();
     }
+    reply_ok("log");
 }
 
 /* "YYYY-MM-DD" "hh:mm:ss" */
@@ -523,7 +701,7 @@ static void cmd_time(uint8_t argc, char *argv[])
         rtc_time_t t;
         if (!parse_time(argv[1], argv[2], &t))
         {
-            con_puts("expected: time YYYY-MM-DD hh:mm:ss (2026 or later)"); con_nl();
+            reply_err("time", "args", "expected: time YYYY-MM-DD hh:mm:ss (2026 or later)");
             return;
         }
         rtc_set_time(&t);
@@ -532,9 +710,10 @@ static void cmd_time(uint8_t argc, char *argv[])
     }
     else if (argc != 1u)
     {
-        con_puts("expected: time [YYYY-MM-DD hh:mm:ss]"); con_nl();
+        reply_err("time", "args", "expected: time [YYYY-MM-DD hh:mm:ss]");
         return;
     }
+    if (console_machine()) { con_puts("@ok,time,"); con_u32(now_s()); con_nl(); return; }
     con_time(now_s()); con_nl();
 }
 
@@ -542,7 +721,8 @@ static void cmd_stream(uint8_t argc, char *argv[])
 {
     if (argc == 2u && strcmp(argv[1], "on") == 0)  { s_stream = true; }
     else if (argc == 2u && strcmp(argv[1], "off") == 0) { s_stream = false; }
-    else if (argc != 1u) { con_puts("expected: stream [on|off]"); con_nl(); return; }
+    else if (argc != 1u) { reply_err("stream", "args", "expected: stream [on|off]"); return; }
+    if (console_machine()) { con_puts("@ok,stream,"); con_puts(s_stream ? "on" : "off"); con_nl(); return; }
     con_puts("stream "); con_puts(s_stream ? "on" : "off"); con_nl();
     if (s_stream) { con_puts("t_s,time,vcc_mv,temp_c"); con_nl(); }
 }
@@ -551,22 +731,184 @@ static void cmd_erase(uint8_t argc, char *argv[])
 {
     if (argc != 2u || strcmp(argv[1], "yes") != 0)
     {
-        con_puts("this clears all counters, the log and the history; type: erase yes"); con_nl();
+        reply_err("erase", "args", "this clears all counters, the log and the history; type: erase yes");
         return;
     }
     erase_state();
-    con_puts("state erased"); con_nl();
+    if (console_machine()) { reply_ok("erase"); return; }
+    con_puts("state erased (settings kept)"); con_nl();
 }
+
+static void cmd_mode(uint8_t argc, char *argv[])
+{
+    if (argc == 2u && strcmp(argv[1], "m") == 0)      { console_set_machine(true); }
+    else if (argc == 2u && strcmp(argv[1], "h") == 0) { console_set_machine(false); }
+    else if (argc != 1u) { reply_err("mode", "args", "expected: mode [h|m]"); return; }
+    if (console_machine()) { con_puts("@ok,mode,m"); }
+    else                   { con_puts("mode human (mode m: tagged replies for programs)"); }
+    con_nl();
+}
+
+static void cmd_snap(uint8_t argc, char *argv[])
+{
+    (void)argv;
+    if (argc != 1u) { reply_err("snap", "args", "expected: snap"); return; }
+    uint16_t mv = 0u;
+    int16_t  dc = HIST_NO_TEMP;
+    if (!read_vcc(&mv)) { reply_err("snap", "fail", "VCC read failed"); return; }
+    if (!read_temp(&dc)) { dc = HIST_NO_TEMP; }
+    uint32_t t = now_s();
+    if (console_machine())
+    {
+        con_puts("@snap,"); con_u32(t); con_putc(','); con_u32(mv); con_putc(',');
+        con_i32(dc); con_nl();
+        reply_ok("snap");
+        return;
+    }
+    con_time(t); con_puts("  "); con_u32(mv); con_puts(" mV  ");
+    if (dc != HIST_NO_TEMP) { con_dec1(dc); con_puts(" C"); } else { con_puts("temp read failed"); }
+    con_nl();
+}
+
+static void set_paused(bool on, const char *cmd)
+{
+    if ((settings()->paused != 0u) != on)
+    {
+        uint16_t mv; int16_t dc;
+        settings_set_paused(on);
+        read_now(&mv, &dc);
+        hist_append(on ? HIST_PAUSE : HIST_UNPAUSE, 0u, now_s(), mv, dc);
+    }
+    if (console_machine()) { reply_ok(cmd); return; }
+    con_puts(on ? "periodic history records paused" : "periodic history records running");
+    con_nl();
+}
+
+static void cmd_pause(uint8_t argc, char *argv[])
+{
+    (void)argv;
+    if (argc != 1u) { reply_err("pause", "args", "expected: pause"); return; }
+    set_paused(true, "pause");
+}
+
+static void cmd_resume(uint8_t argc, char *argv[])
+{
+    (void)argv;
+    if (argc != 1u) { reply_err("resume", "args", "expected: resume"); return; }
+    set_paused(false, "resume");
+}
+
+static void cmd_interval(uint8_t argc, char *argv[])
+{
+    if (argc == 2u)
+    {
+        uint32_t s;
+        if (!con_parse_u32(argv[1], 65535u, &s))
+        {
+            reply_err("interval", "args", "expected: interval [s] (even, 2..3600)");
+            return;
+        }
+        if (s != settings()->interval_s)
+        {
+            if (!settings_set_interval((uint16_t)s))
+            {
+                reply_err("interval", "range", "interval must be even, 2..3600 s");
+                return;
+            }
+            hist_append(HIST_CONFIG, HIST_CFG_INTERVAL, now_s(), (uint16_t)s, HIST_NO_TEMP);
+        }
+    }
+    else if (argc != 1u) { reply_err("interval", "args", "expected: interval [s]"); return; }
+
+    if (console_machine()) { con_puts("@ok,interval,"); con_u32(settings()->interval_s); con_nl(); return; }
+    con_puts("history interval "); con_u32(settings()->interval_s); con_puts(" s"); con_nl();
+}
+
+static void cmd_mark(uint8_t argc, char *argv[])
+{
+    uint32_t code = 0u;
+    if (argc > 2u || (argc == 2u && !con_parse_u32(argv[1], 255u, &code)))
+    {
+        reply_err("mark", "args", "expected: mark [code] (0..255)");
+        return;
+    }
+    uint16_t mv, seq = 0u;
+    int16_t  dc;
+    read_now(&mv, &dc);
+    hist_append(HIST_MARK, (uint8_t)code, now_s(), mv, dc);
+    (void)hist_newest_seq(&seq);
+    if (console_machine()) { con_puts("@ok,mark,"); con_u32(seq); con_nl(); return; }
+    con_puts("mark #"); con_u32(seq); con_puts(", code "); con_u32(code); con_nl();
+}
+
+static void cmd_offset(uint8_t argc, char *argv[])
+{
+    if (argc == 3u)
+    {
+        int16_t v;
+        bool t = strcmp(argv[1], "t") == 0;
+        if ((!t && strcmp(argv[1], "v") != 0) || !parse_i16(argv[2], &v))
+        {
+            reply_err("offset", "args", "expected: offset [t <0.1 C> | v <mV>]");
+            return;
+        }
+        if (t && v != settings()->toff_dc)
+        {
+            if (!settings_set_toff(v)) { reply_err("offset", "range", "temperature offset: -100..100 (0.1 C)"); return; }
+            hist_append(HIST_CONFIG, HIST_CFG_TOFF, now_s(), 0u, v);
+        }
+        else if (!t && v != settings()->voff_mv)
+        {
+            if (!settings_set_voff(v)) { reply_err("offset", "range", "VCC offset: -200..200 mV"); return; }
+            hist_append(HIST_CONFIG, HIST_CFG_VOFF, now_s(), (uint16_t)v, HIST_NO_TEMP);
+        }
+    }
+    else if (argc != 1u) { reply_err("offset", "args", "expected: offset [t <0.1 C> | v <mV>]"); return; }
+
+    if (console_machine())
+    {
+        con_puts("@ok,offset,t="); con_i32(settings()->toff_dc);
+        con_puts(",v="); con_i32(settings()->voff_mv); con_nl();
+        return;
+    }
+    con_puts("offsets: temperature "); con_dec1(settings()->toff_dc);
+    con_puts(" C, VCC "); con_i32(settings()->voff_mv); con_puts(" mV"); con_nl();
+}
+
+static void cmd_reset(uint8_t argc, char *argv[])
+{
+    bool bor = argc == 2u && strcmp(argv[1], "bor") == 0;
+    if (argc != 2u || (!bor && strcmp(argv[1], "por") != 0))
+    {
+        reply_err("reset", "args", "expected: reset por|bor (POR keeps the RTC, BOR clears it)");
+        return;
+    }
+    if (console_machine()) { con_puts("@ok,reset,"); con_puts(bor ? "bor" : "por"); }
+    else                   { con_puts(bor ? "software BOR..." : "software POR..."); }
+    con_nl();
+    state_save();
+    (void)uart_flush(CON_UART);
+    if (bor) { pmm_software_bor(); } else { pmm_software_por(); }
+}
+
 
 static const console_cmd_t k_cmds[] =
 {
-    { "help",   "",                      "list commands",                         cmd_help   },
-    { "status", "",                      "counters, supply, temperature, time",   cmd_status },
-    { "log",    "",                      "dump the 16-sample log as CSV",         cmd_log    },
-    { "hist",   "[n]",                   "dump the long FRAM history as CSV",     cmd_hist   },
-    { "time",   "[YYYY-MM-DD hh:mm:ss]", "show or set the clock",                 cmd_time   },
-    { "stream", "[on|off]",              "print every sample as it is taken",     cmd_stream },
-    { "erase",  "yes",                   "clear counters, log, history (like S2)", cmd_erase  },
+    { "help",     "",                      "list commands",                          cmd_help     },
+    { "status",   "",                      "counters, supply, memory, settings",     cmd_status   },
+    { "log",      "",                      "dump the 16-sample log as CSV",          cmd_log      },
+    { "hist",     "[n | since seq [max]]", "dump the long FRAM history as CSV",      cmd_hist     },
+    { "time",     "[YYYY-MM-DD hh:mm:ss]", "show or set the clock",                  cmd_time     },
+    { "stream",   "[on|off]",              "print every sample as it is taken",      cmd_stream   },
+    { "snap",     "",                      "one reading now (not stored)",           cmd_snap     },
+    { "pause",    "",                      "stop periodic history records",          cmd_pause    },
+    { "resume",   "",                      "restart periodic history records",       cmd_resume   },
+    { "interval", "[s]",                   "history interval, even, 2..3600 s",      cmd_interval },
+    { "mark",     "[code]",                "add a bookmark record (code 0..255)",    cmd_mark     },
+    { "offset",   "[t dC | v mV]",         "sensor offsets (0.1 C, mV)",             cmd_offset   },
+    { "mode",     "[h|m]",                 "human or machine replies",               cmd_mode     },
+    { "reset",    "por|bor",               "software reset (POR keeps the RTC)",     cmd_reset    },
+    { "erase",    "yes",                   "clear counters, log, history (like S2)", cmd_erase    },
 };
 
 static bool on_uart_rx(uart_id_t id, uint8_t byte, bool error)
@@ -600,6 +942,9 @@ static void console_start(cs_status_t cs)
     if (cs == CS_LFXT_FAULT) { con_puts(", crystal FAILED (UART on DCO)"); }
     con_nl();
     con_puts("type help for commands"); con_nl();
+    con_puts("@boot,fw=" FW_PROTO ",why="); con_puts(why_tag());
+    con_puts(",clock="); con_puts(k_clock_tag[s_clock]);
+    con_puts(",boots="); con_u32(g_state.boots); con_nl();
     con_prompt();
 }
 
@@ -614,15 +959,22 @@ static void console_stop(void)
 
 /* ------------------------------------------------------------- modes */
 
-static void enter_deep_sleep(void)
+static void enter_deep_sleep(uint16_t mv)
 {
     g_state.deep_sleeps++;
     state_save();
 
     if (s_con_up)
     {
-        con_nl();
-        con_puts("supply low, entering LPM3.5 (checks every minute)"); con_nl();
+        if (console_machine())
+        {
+            con_puts("@sleep,"); con_u32(now_s()); con_putc(','); con_u32(mv); con_nl();
+        }
+        else
+        {
+            con_nl();
+            con_puts("supply low, entering LPM3.5 (checks every minute)"); con_nl();
+        }
         console_stop();
     }
 
@@ -644,8 +996,8 @@ static bool take_sample(void)
 {
     uint16_t mv = 0;
     int16_t  dc = 0;
-    if (adc_read_vcc_mv(&mv) != ADC_OK) { return false; }
-    (void)adc_read_temp_dc(&dc);
+    if (!read_vcc(&mv)) { return false; }
+    (void)read_temp(&dc);
 
     bool new_pass = (g_state.log_head == 0u);
     log_entry_t *e = &g_state.log[g_state.log_head];
@@ -657,7 +1009,7 @@ static bool take_sample(void)
     g_state.samples++;
     if (mv < g_state.min_vcc_mv) { g_state.min_vcc_mv = mv; }
     state_save();
-    if (g_state.samples % HIST_EVERY_SAMPLES == 0u)
+    if (!settings()->paused && g_state.samples % (settings()->interval_s / 2u) == 0u)
     {
         hist_append(HIST_SAMPLE, 0u, e->t, mv, dc);
     }
@@ -666,7 +1018,7 @@ static bool take_sample(void)
     {
         hist_append(HIST_SLEEP, 0u, e->t, mv, dc);
         lpm35_on_sleep();
-        enter_deep_sleep();
+        enter_deep_sleep(mv);
     }
     return new_pass;
 }
@@ -936,13 +1288,14 @@ int main(void)
         state_reset();
     }
     hist_init();
+    settings_init();                    /* before any reading: offsets */
 
     if (pmm_woke_from_lpmx5())
     {
         /* Minute check-in from low-energy mode: stay asleep unless recovered */
         s_clock = CLOCK_KEPT;
         uint16_t mv = 0;
-        bool ok = adc_read_vcc_mv(&mv) == ADC_OK;
+        bool ok = read_vcc(&mv);
         hist_append(HIST_CHECKIN, 0u, now_s(), mv, HIST_NO_TEMP);
         if (!ok || mv < resume_mv())
         {
@@ -950,7 +1303,7 @@ int main(void)
 #if LPM35_TEST
             flash(false, 2u, 100u, 150u);   /* check-in: staying asleep */
 #endif
-            enter_deep_sleep();
+            enter_deep_sleep(mv);
         }
         hist_append(HIST_RESUME, 0u, now_s(), mv, HIST_NO_TEMP);
         lpm35_on_resume();
@@ -987,9 +1340,11 @@ int main(void)
     if (!pmm_woke_from_lpmx5())
     {
         uint16_t bmv = 0;
-        (void)adc_read_vcc_mv(&bmv);
-        hist_append(HIST_BOOT, (uint8_t)((uint8_t)why | (s_clock == CLOCK_RESTORED ? 0x80u : 0u)),
-                    now_s(), bmv, HIST_NO_TEMP);
+        (void)read_vcc(&bmv);
+        uint8_t arg = (uint8_t)why;
+        if (s_clock == CLOCK_RESTORED) { arg |= HIST_BOOT_RESTORED; }
+        if (why == PMM_BOOT_SOFTWARE && (pmm_reset_flags() & PMM_RST_SWBOR)) { arg |= HIST_BOOT_SWBOR; }
+        hist_append(HIST_BOOT, arg, now_s(), bmv, HIST_NO_TEMP);
     }
     g_state.boots++;
     if (why == PMM_BOOT_POWER_ON) { g_state.power_losses++; }
@@ -1055,7 +1410,16 @@ int main(void)
             if (new_pass) { flash(false, 1u, SAMPLE_FLASH_MS, 0u); }
             if (s_stream && s_con_up && g_state.log_count)
             {
-                con_log_line(&g_state.log[(g_state.log_head + LOG_LEN - 1u) % LOG_LEN]);
+                const log_entry_t *e = &g_state.log[(g_state.log_head + LOG_LEN - 1u) % LOG_LEN];
+                if (console_machine())
+                {
+                    con_puts("@s,"); con_u32(e->t); con_putc(','); con_u32(e->vcc_mv);
+                    con_putc(','); con_i32(e->temp_dc); con_nl();
+                }
+                else
+                {
+                    con_log_line(e);
+                }
             }
         }
 
@@ -1069,7 +1433,7 @@ int main(void)
         {
             s_s1_event = false;
             uint16_t mv = 0;
-            if (adc_read_vcc_mv(&mv) == ADC_OK && mv > 2000u)
+            if (read_vcc(&mv) && mv > 2000u)
             {
                 flash(false, (uint8_t)((mv - 2000u) / 100u), 20u, 200u);
             }

@@ -110,6 +110,22 @@ bool hist_get(uint16_t i, uint16_t count, hist_rec_t *out)
     return true;
 }
 
+bool hist_newest_seq(uint16_t *seq)
+{
+    if (s_empty) { return false; }
+    *seq = s_ring[s_newest].seq;
+    return true;
+}
+
+uint16_t hist_index_after(uint16_t seq, uint16_t count)
+{
+    if (s_empty || count == 0u) { return count; }
+    int16_t newer = (int16_t)(s_ring[s_newest].seq - seq);    /* records after seq */
+    if (newer <= 0) { return count; }
+    if ((uint16_t)newer >= count) { return 0u; }
+    return (uint16_t)(count - (uint16_t)newer);
+}
+
 bool hist_newest_t(uint32_t *t)
 {
     if (s_empty) { return false; }
@@ -137,6 +153,10 @@ const char *hist_kind_name(uint8_t kind)
     case HIST_RESUME:    return "resume";
     case HIST_BOOT:      return "boot";
     case HIST_CLOCK_SET: return "clock";
+    case HIST_PAUSE:     return "pause";
+    case HIST_UNPAUSE:   return "unpause";
+    case HIST_MARK:      return "mark";
+    case HIST_CONFIG:    return "config";
     default:             return "?";
     }
 }

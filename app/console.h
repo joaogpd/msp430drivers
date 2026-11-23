@@ -9,6 +9,11 @@
  * While a line waits for console_poll(), further input is dropped (and a
  * BEL is echoed), so a command never sees a line that changes under it.
  *
+ * Machine mode (console_set_machine): no echo, no BEL, no prompt, and an
+ * unknown command is answered "@err,<cmd>,unknown". Commands check
+ * console_machine() to print tagged replies (docs/console_protocol.md).
+ * console_init() always starts in human mode.
+ *
  * Output helpers (con_*) queue text on the UART and sleep while its buffer
  * is full; main context only. No printf: the helpers cover what the
  * logger prints, at a fraction of the code size.
@@ -41,6 +46,10 @@ bool console_rx(uint8_t byte, bool error);
 
 /* true while a complete line waits for console_poll() */
 bool console_pending(void);
+
+/* Human (false, default) or machine (true) mode */
+void console_set_machine(bool on);
+bool console_machine(void);
 
 /* Main context: run a waiting line, then print the prompt. */
 void console_poll(void);

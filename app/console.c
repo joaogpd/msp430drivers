@@ -8,11 +8,15 @@ static uart_id_t            s_uart;
 static const console_cmd_t *s_cmds;
 static uint8_t              s_count;
 static bool                 s_bound;
+static volatile bool        s_machine;  /* no echo, no prompt, tagged replies */
 
 static char          s_line[CONSOLE_LINE_MAX + 1u];
 static volatile uint8_t s_len;
 static volatile bool s_ready;
 static bool          s_last_cr;     /* swallow the LF of a CR LF pair */
+
+void console_set_machine(bool on) { s_machine = on; }
+bool console_machine(void)        { return s_machine; }
 
 void console_init(uart_id_t uart, const console_cmd_t *cmds, uint8_t count)
 {
@@ -22,11 +26,13 @@ void console_init(uart_id_t uart, const console_cmd_t *cmds, uint8_t count)
     s_len   = 0u;
     s_ready = false;
     s_last_cr = false;
+    s_machine = false;                  /* every start is in human mode */
     s_bound = true;
 }
 
 static void echo(const char *s, uint16_t n)
 {
+    if (s_machine) { return; }          /* the host does not want echo */
     (void)uart_write(s_uart, s, n);     /* non-blocking: ISR context */
 }
 
@@ -104,10 +110,17 @@ void console_poll(void)
         }
         if (!found)
         {
-            con_puts("unknown command '");
-            con_puts(argv[0]);
-            con_puts("', try help");
-            con_nl();
+            if (s_machine)
+            {
+                con_puts("@err,"); con_puts(argv[0]); con_puts(",unknown"); con_nl();
+            }
+            else
+            {
+                con_puts("unknown command '");
+                con_puts(argv[0]);
+                con_puts("', try help");
+                con_nl();
+            }
         }
     }
 
@@ -156,7 +169,7 @@ void con_nl(void)
 
 void con_prompt(void)
 {
-    con_puts("> ");
+    if (!s_machine) { con_puts("> "); }
 }
 
 void con_u32(uint32_t v)
